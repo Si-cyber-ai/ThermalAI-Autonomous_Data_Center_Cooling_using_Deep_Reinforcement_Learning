@@ -20,6 +20,7 @@ from workload.synthetic_generator import SyntheticWorkloadGenerator, WorkloadSce
 from rl_agent.dqn_agent import DQNAgent
 from controllers.pid_controller import PIDController
 from monitoring.laptop_sensors import LaptopSensorMonitor
+from agents.cooling_agent import CoolingAgent
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -210,9 +211,41 @@ def display_digital_twin(config, controller_type, ambient_temp, workload_pattern
     if run_simulation and not st.session_state.simulation_running:
         st.session_state.simulation_running = True
         state, _ = env.reset()
+        agent_status_ph = st.empty()
         metrics_ph = st.empty()
+        energy_ph = st.empty()
         heatmap_ph = st.empty()
         chart_ph = st.empty()
+        energy_chart_ph = st.empty()
+        summary_ph = st.empty()
+
+        # --- Energy tracking (per-step averages) ---
+        rl_total_energy = 0.0
+        pid_total_energy = 0.0
+        energy_steps = 0
+        rl_energy_timeline = []
+        pid_energy_timeline = []
+
+        # --- Supervisory AI Cooling Agent ---
+        cooling_agent = CoolingAgent()
+
+        # Baseline PID env for energy comparison
+        env_baseline, _ = initialize_environment(config)
+        _, pid_baseline = initialize_controllers(config, env_baseline)
+        env_baseline.ambient_temp = ambient_temp
+        env_baseline.heat_model.alpha = alpha
+        env_baseline.heat_model.beta = beta
+        if scenario != "Normal":
+            grid_size = tuple(config["simulation"]["grid_size"])
+            scenario_fn = {
+                "Hotspot": WorkloadScenario.create_hotspot_scenario,
+                "Edge Heavy": WorkloadScenario.create_edge_heavy_scenario,
+                "Gradient": WorkloadScenario.create_gradient_scenario,
+            }.get(scenario)
+            if scenario_fn:
+                env_baseline.cpu_workload = scenario_fn(grid_size)
+        baseline_state, _ = env_baseline.reset()
+        baseline_agent = CoolingAgent()
 
         for step in range(100):
             if not st.session_state.simulation_running:
@@ -222,32 +255,114 @@ def display_digital_twin(config, controller_type, ambient_temp, workload_pattern
             cooling_levels = grids["cooling_levels"]
             workload = grids["cpu_workload"]
 
+            # --- Supervisor decides strategy & applies safety filter ---
             if controller_type == "RL (DQN)":
-                action = rl_agent.select_action(state, training=False)
+                _, rl_action, agent_info = cooling_agent.act(
+                    env, rl_agent, pid_controller, state, training=False
+                )
+                action = rl_action
             else:
+                _, _, agent_info = cooling_agent.act(
+                    env, rl_agent, pid_controller, state, training=False
+                )
+                # For PID mode, the agent internally selects PID when risk is
+                # moderate, but we always honour the user's controller choice:
                 proposed = pid_controller.compute(temperatures)
                 env.cooling_levels = np.clip(proposed, 0.0, 1.0)
                 action = 1
 
             state, reward, terminated, truncated, info = env.step(action)
+
+            # Post-step safety enforcement (always)
+            post_info = cooling_agent.post_step_safety(env)
+
+            # --- Compute energy for the *selected* controller ---
+            selected_energy_step = float(np.mean(env.get_state_grid()["cooling_levels"]))
+
+            # --- Run PID baseline step in parallel ---
+            bl_grids = env_baseline.get_state_grid()
+            bl_proposed = pid_baseline.compute(bl_grids["temperatures"])
+            env_baseline.cooling_levels = np.clip(bl_proposed, 0.0, 1.0)
+            baseline_state, _, bl_term, _, bl_info = env_baseline.step(1)
+            baseline_agent.post_step_safety(env_baseline)
+            baseline_energy_step = float(np.mean(env_baseline.get_state_grid()["cooling_levels"]))
+
+            # Always: selected controller = RL bucket, baseline = PID bucket
+            rl_total_energy += selected_energy_step
+            pid_total_energy += baseline_energy_step
+            energy_steps += 1
+
+            rl_avg_energy = rl_total_energy / energy_steps
+            pid_avg_energy = pid_total_energy / energy_steps
+
+            rl_energy_timeline.append(rl_avg_energy)
+            pid_energy_timeline.append(pid_avg_energy)
+
+            energy_saved_pct = (
+                max(min(((pid_avg_energy - rl_avg_energy) / pid_avg_energy) * 100, 100.0), -100.0)
+                if pid_avg_energy > 0 else 0.0
+            )
+
+            # --- History ---
             st.session_state.history["temperatures"].append(temperatures.copy())
             st.session_state.history["cooling"].append(cooling_levels.copy())
             st.session_state.history["workload"].append(workload.copy())
             st.session_state.history["rewards"].append(reward)
             st.session_state.step_count += 1
 
+            # --- Agent status bar ---
+            risk_colors = {
+                "normal": "🟢", "moderate_risk": "🟡",
+                "high_risk": "🟠", "emergency": "🔴",
+            }
+            strategy_labels = {
+                "rl_control": "RL Agent",
+                "pid_control": "PID Controller",
+                "strong_cooling": "Strong Cooling",
+                "max_cooling": "Emergency Max Cooling",
+            }
+            with agent_status_ph.container():
+                a1, a2, a3, a4 = st.columns(4)
+                a1.metric("Agent Mode", f"{risk_colors.get(agent_info['risk_level'], '⚪')} {agent_info['risk_level'].replace('_', ' ').title()}")
+                a2.metric("Cooling Strategy", strategy_labels.get(agent_info['strategy'], agent_info['strategy']))
+                a3.metric("Safety Overrides", str(agent_info.get('override_count', 0)))
+                a4.metric("Filter Active", "Yes" if post_info.get('override_active', False) else "No")
+
+            # --- Live metrics ---
+            # Re-read temperatures after safety correction
+            corrected_temps = env.get_state_grid()["temperatures"]
+            avg_t = float(np.mean(corrected_temps))
+            max_t = float(np.max(corrected_temps))
             with metrics_ph.container():
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Avg Temperature", f"{info['avg_temperature']:.1f} °C")
-                c2.metric("Max Temperature", f"{info['max_temperature']:.1f} °C")
+                c1, c2, c3, c4, c5, c6 = st.columns(6)
+                c1.metric("Avg Temperature", f"{avg_t:.1f} °C")
+                c2.metric("Max Temperature", f"{max_t:.1f} °C")
                 c3.metric("Avg Cooling", f"{info['avg_cooling']:.2f}")
-                c4.metric("Violations", str(info["hotspots"]))
+                hotspot_count = int(np.sum(corrected_temps > 75.0))
+                c4.metric("Hotspots (>75°C)", str(hotspot_count))
+                violations_now = int(np.sum(corrected_temps > 80.0))
+                c5.metric("Violations (>80°C)", str(violations_now))
+                c6.metric("Total Violations", str(info["violations"]))
+
+            # --- Live energy metrics ---
+            with energy_ph.container():
+                st.markdown("#### ⚡ Energy Efficiency")
+                e1, e2, e3, e4 = st.columns(4)
+                e1.metric("Energy Saved", f"{energy_saved_pct:.2f}%")
+                e2.metric("RL Avg Energy/Step", f"{rl_avg_energy:.4f}")
+                e3.metric("PID Avg Energy/Step", f"{pid_avg_energy:.4f}")
+                e4.metric("Steps", str(energy_steps))
+                if energy_saved_pct < 0:
+                    st.info("RL prioritises thermal safety in this scenario, resulting in higher cooling energy.")
+                else:
+                    st.success("RL improves cooling energy efficiency compared to PID.")
 
             with heatmap_ph.container():
                 c1, c2, c3 = st.columns(3)
-                c1.plotly_chart(create_heatmap(temperatures, "Temperature (°C)", "Hot"), key=f"dt_temp_{step}")
-                c2.plotly_chart(create_heatmap(cooling_levels, "Cooling Level", "Blues"), key=f"dt_cool_{step}")
-                c3.plotly_chart(create_heatmap(workload, "CPU Workload", "Viridis"), key=f"dt_wl_{step}")
+                c1.plotly_chart(create_heatmap(temperatures, "Temperature (°C)", "Hot"), key=f"dt_temp_{step}", width="stretch")
+                c2.plotly_chart(create_heatmap(cooling_levels, "Cooling Level", "Blues"), key=f"dt_cool_{step}", width="stretch")
+                c3.plotly_chart(create_heatmap(workload, "CPU Workload", "Viridis"), key=f"dt_wl_{step}", width="stretch")
+                st.caption("Spatial view of rack temperatures, cooling effort, and CPU workload across the server grid.")
 
             with chart_ph.container():
                 if len(st.session_state.history["temperatures"]) > 1:
@@ -258,9 +373,40 @@ def display_digital_twin(config, controller_type, ambient_temp, workload_pattern
                     fig.add_trace(go.Scatter(y=cool_mean, mode="lines", name="Cooling"), row=2, col=1)
                     fig.update_layout(height=400, showlegend=False)
                     st.plotly_chart(fig, key=f"dt_ts_{step}")
+                    st.caption("Tracks average temperature and cooling level across simulation steps to visualise controller behaviour.")
+
+            # --- Live energy comparison chart ---
+            with energy_chart_ph.container():
+                if step > 0:
+                    edf = pd.DataFrame({
+                        "Step": list(range(step + 1)),
+                        "RL Energy": rl_energy_timeline,
+                        "PID Energy": pid_energy_timeline,
+                    })
+                    fig = px.line(edf, x="Step", y=["RL Energy", "PID Energy"],
+                                  title="Cooling Energy Comparison")
+                    fig.update_layout(height=350)
+                    st.plotly_chart(fig, key=f"dt_ecmp_{step}", width="stretch")
+                    st.caption("Compares average energy per step between the selected controller and a PID baseline running in parallel.")
+
             time.sleep(0.1)
             if terminated:
                 break
+
+        # --- Final summary panel ---
+        with summary_ph.container():
+            st.divider()
+            st.markdown("### Final Energy Summary")
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("Energy Saved", f"{energy_saved_pct:.2f}%")
+            s2.metric("RL Avg Energy/Step", f"{rl_avg_energy:.4f}")
+            s3.metric("PID Avg Energy/Step", f"{pid_avg_energy:.4f}")
+            s4.metric("Total Steps", str(energy_steps))
+            if energy_saved_pct < 0:
+                st.info("RL prioritises thermal safety in this scenario, resulting in higher cooling energy.")
+            else:
+                st.success("RL improves cooling energy efficiency compared to PID.")
+
         st.session_state.simulation_running = False
     else:
         st.info("Click **▶️ Run Simulation** in the sidebar to start the Digital Twin.")
@@ -292,34 +438,40 @@ def page_training_monitor():
         # 1. Reward vs Episode
         fig = px.line(df, x="episode", y="total_reward", title="Total Reward per Episode")
         fig.update_layout(height=320)
-        st.plotly_chart(fig, use_container_width=True, key="tm_reward")
+        st.plotly_chart(fig, key="tm_reward", width="stretch")
+        st.caption("Total reward earned per training episode. Higher values indicate the agent is learning to balance cooling efficiency with temperature safety.")
 
         # 3. Energy / Cooling vs Episode
         fig = px.line(df, x="episode", y="avg_cooling", title="Average Cooling Level per Episode")
         fig.update_layout(height=320)
-        st.plotly_chart(fig, use_container_width=True, key="tm_cooling")
+        st.plotly_chart(fig, key="tm_cooling", width="stretch")
+        st.caption("Average cooling effort applied per episode. Lower values mean the agent uses less energy while maintaining safe temperatures.")
 
         # 5. Loss vs Episode
         fig = px.line(df, x="episode", y="avg_loss", title="Average Loss per Episode")
         fig.update_layout(height=320)
-        st.plotly_chart(fig, use_container_width=True, key="tm_loss")
+        st.plotly_chart(fig, key="tm_loss", width="stretch")
+        st.caption("DQN training loss — should decrease over time as the Q-network converges.")
 
     with col2:
         # 2. Avg Temperature vs Episode
         fig = px.line(df, x="episode", y="avg_temperature", title="Average Temperature per Episode")
         fig.add_hline(y=80, line_dash="dash", line_color="red", annotation_text="Max Temp Limit")
         fig.update_layout(height=320)
-        st.plotly_chart(fig, use_container_width=True, key="tm_temp")
+        st.plotly_chart(fig, key="tm_temp", width="stretch")
+        st.caption("Average temperature per episode. The red dashed line indicates the safety threshold (80 °C).")
 
         # 4. Violations vs Episode
         fig = px.bar(df, x="episode", y="total_violations", title="Safety Violations per Episode")
         fig.update_layout(height=320)
-        st.plotly_chart(fig, use_container_width=True, key="tm_violations")
+        st.plotly_chart(fig, key="tm_violations", width="stretch")
+        st.caption("Number of racks exceeding the 80 °C safety limit per episode. Target: zero violations.")
 
         # 6. Epsilon vs Episode
         fig = px.line(df, x="episode", y="epsilon", title="Epsilon (Exploration) per Episode")
         fig.update_layout(height=320)
-        st.plotly_chart(fig, use_container_width=True, key="tm_epsilon")
+        st.plotly_chart(fig, key="tm_epsilon", width="stretch")
+        st.caption("Exploration rate (ε-greedy). Decays from 1.0 → 0.05 as the agent shifts from exploration to exploitation.")
 
 
 # ===================================================================
@@ -346,7 +498,8 @@ def page_action_distribution():
             title="Action Frequency",
         )
         fig.update_layout(height=350)
-        st.plotly_chart(fig, use_container_width=True, key="ad_cumulative")
+        st.plotly_chart(fig, key="ad_cumulative", width="stretch")
+        st.caption("Frequency of each discrete cooling action chosen by the RL agent across all training steps.")
 
     # --- Per-episode action distribution from episode logs ---
     if not ep_df.empty and "action_distribution" in ep_df.columns:
@@ -373,7 +526,8 @@ def page_action_distribution():
             if a in act_df.columns:
                 fig.add_trace(go.Bar(x=act_df["episode"], y=act_df[a], name=f"Action {a}"))
         fig.update_layout(barmode="stack", title="Action Distribution per Episode", height=400)
-        st.plotly_chart(fig, use_container_width=True, key="ad_per_episode")
+        st.plotly_chart(fig, key="ad_per_episode", width="stretch")
+        st.caption("Stacked action distribution per episode — shows how the agent's action preferences evolve during training.")
 
 
 # ===================================================================
@@ -409,10 +563,11 @@ def page_temperature_heatmap():
     fig.add_hline(y=80, line_dash="dash", line_color="red", annotation_text="Max Limit")
     fig.add_hline(y=85, line_dash="dot", line_color="darkred", annotation_text="Critical")
     fig.update_layout(height=400)
-    st.plotly_chart(fig, use_container_width=True, key="hm_trajectory")
+    st.plotly_chart(fig, key="hm_trajectory", width="stretch")
+    st.caption("Average and maximum rack temperatures over simulation steps. Red dashed = safety limit (80 °C), dark red dotted = critical (85 °C).")
 
     # Animated heatmap via slider
-    st.markdown("#### Spatial Temperature (simulated grid)")
+    st.markdown("#### Spatial Temperature (reconstructed from logged stats)")
     step_idx = st.slider("Step", int(ep_data["step"].min()), int(ep_data["step"].max()), int(ep_data["step"].min()), key="hm_step_slider")
     row_data = ep_data[ep_data["step"] == step_idx]
     if not row_data.empty:
@@ -422,7 +577,8 @@ def page_temperature_heatmap():
         grid = np.random.default_rng(seed=step_idx).normal(loc=avg_t, scale=max(0.5, (max_t - avg_t) / 3), size=(rows, cols))
         grid = np.clip(grid, avg_t - 5, max_t)
         fig = create_heatmap(grid, f"Temperature Grid – Step {step_idx}", "Hot")
-        st.plotly_chart(fig, use_container_width=True, key=f"hm_grid_{step_idx}")
+        st.plotly_chart(fig, key=f"hm_grid_{step_idx}", width="stretch")
+        st.caption("Approximate spatial temperature distribution reconstructed from logged average and max values.")
 
 
 # ===================================================================
@@ -438,39 +594,92 @@ def page_comparison(config):
         env, workload_gen = initialize_environment(config)
         rl_agent, pid_controller = initialize_controllers(config, env)
 
-        results = {"RL": {"temps": [], "cooling": [], "rewards": [], "violations": []},
-                   "PID": {"temps": [], "cooling": [], "rewards": [], "violations": []}}
+        results = {"RL": {"temps": [], "cooling": [], "rewards": [], "violations": [],
+                          "energy_cum": []},
+                   "PID": {"temps": [], "cooling": [], "rewards": [], "violations": [],
+                           "energy_cum": []}}
 
         for label, use_rl in [("RL", True), ("PID", False)]:
             state, _ = env.reset()
+            agent = CoolingAgent()
+            cum_energy = 0.0
             for _ in range(num_steps):
                 if use_rl:
-                    action = rl_agent.select_action(state, training=False)
+                    _, rl_action, _ = agent.act(
+                        env, rl_agent, pid_controller, state, training=False
+                    )
+                    action = rl_action
                 else:
                     grids = env.get_state_grid()
                     proposed = pid_controller.compute(grids["temperatures"])
                     env.cooling_levels = np.clip(proposed, 0.0, 1.0)
                     action = 1
                 state, reward, terminated, truncated, info = env.step(action)
-                results[label]["temps"].append(info["avg_temperature"])
-                results[label]["cooling"].append(info["avg_cooling"])
+                agent.post_step_safety(env)
+                energy_step = float(np.mean(env.get_state_grid()["cooling_levels"]))
+                cum_energy += energy_step
+                corrected_temps = env.get_state_grid()["temperatures"]
+                results[label]["temps"].append(float(np.mean(corrected_temps)))
+                results[label]["cooling"].append(float(np.mean(env.get_state_grid()["cooling_levels"])))
                 results[label]["rewards"].append(reward)
-                results[label]["violations"].append(info["hotspots"])
+                results[label]["violations"].append(int(np.sum(corrected_temps > 80.0)))
+                results[label]["energy_cum"].append(cum_energy)
                 if terminated:
                     break
 
-        # Time-series comparison
-        fig = make_subplots(rows=2, cols=2,
-                            subplot_titles=("Avg Temperature", "Cooling Level", "Reward", "Violations"))
+        # --- Energy Saved % (using average energy per step) ---
+        rl_steps = len(results["RL"]["energy_cum"])
+        pid_steps = len(results["PID"]["energy_cum"])
+        rl_energy = results["RL"]["energy_cum"][-1] / rl_steps if rl_steps > 0 else 0
+        pid_energy = results["PID"]["energy_cum"][-1] / pid_steps if pid_steps > 0 else 0
+        energy_saved_pct = (max(min((pid_energy - rl_energy) / pid_energy * 100, 100.0), -100.0)) if pid_energy > 0 else 0.0
+
+        st.markdown("### ⚡ Energy Efficiency")
+        e1, e2, e3, e4 = st.columns(4)
+        e1.metric("Energy Saved", f"{energy_saved_pct:.2f}%")
+        e2.metric("RL Avg Energy/Step", f"{rl_energy:.4f}")
+        e3.metric("PID Avg Energy/Step", f"{pid_energy:.4f}")
+        e4.metric("Steps", f"RL={rl_steps}, PID={pid_steps}")
+        if energy_saved_pct < 0:
+            st.info("RL prioritises thermal safety in this scenario, resulting in higher cooling energy.")
+        else:
+            st.success("RL improves cooling energy efficiency compared to PID.")
+        st.divider()
+
+        # Time-series comparison (original 4 + energy)
+        fig = make_subplots(rows=3, cols=2,
+                            subplot_titles=("Avg Temperature", "Cooling Level",
+                                            "Reward", "Violations",
+                                            "Cumulative Energy", "Cooling Level Distribution"))
         for i, (metric, title) in enumerate([("temps", "Temp"), ("cooling", "Cool"),
-                                              ("rewards", "Reward"), ("violations", "Viol")], 1):
+                                              ("rewards", "Reward"), ("violations", "Viol"),
+                                              ("energy_cum", "Energy")], 1):
             r, c = (i - 1) // 2 + 1, (i - 1) % 2 + 1
             fig.add_trace(go.Scatter(y=results["RL"][metric], mode="lines", name=f"RL-{title}",
-                                     line=dict(color="blue")), row=r, col=c)
+                                     line=dict(color="blue"), showlegend=(i == 1)),
+                          row=r, col=c)
             fig.add_trace(go.Scatter(y=results["PID"][metric], mode="lines", name=f"PID-{title}",
-                                     line=dict(color="orange")), row=r, col=c)
-        fig.update_layout(height=600, title_text="RL vs PID Time Series")
-        st.plotly_chart(fig, use_container_width=True, key="cmp_timeseries")
+                                     line=dict(color="orange"), showlegend=(i == 1)),
+                          row=r, col=c)
+
+        # Cooling level distribution (histogram) in row=3, col=2
+        fig.add_trace(go.Histogram(x=results["RL"]["cooling"], name="RL", opacity=0.6,
+                                    marker_color="blue"), row=3, col=2)
+        fig.add_trace(go.Histogram(x=results["PID"]["cooling"], name="PID", opacity=0.6,
+                                    marker_color="orange"), row=3, col=2)
+        fig.update_layout(height=800, title_text="RL vs PID Time Series", barmode="overlay")
+        st.plotly_chart(fig, key="cmp_timeseries", width="stretch")
+        st.caption("Side-by-side comparison of RL vs PID across temperature, cooling, reward, violations, cumulative energy, and cooling-level distribution.")
+
+        # Energy bar chart
+        st.markdown("### Energy Usage Bar Chart")
+        bar_fig = go.Figure(data=[
+            go.Bar(name="RL", x=["Avg Energy/Step"], y=[rl_energy], marker_color="blue"),
+            go.Bar(name="PID", x=["Avg Energy/Step"], y=[pid_energy], marker_color="orange"),
+        ])
+        bar_fig.update_layout(barmode="group", height=350, title="Average Cooling Energy per Step")
+        st.plotly_chart(bar_fig, key="cmp_energy_bar", width="stretch")
+        st.caption("Average cooling energy consumed per timestep. Lower is more efficient.")
 
         # Summary table
         summary = {}
@@ -482,10 +691,20 @@ def page_comparison(config):
                 "Avg Cooling": f"{np.mean(r['cooling']):.3f}",
                 "Total Reward": f"{np.sum(r['rewards']):.2f}",
                 "Total Violations": int(np.sum(r["violations"])),
+                "Total Energy": f"{r['energy_cum'][-1]:.2f}" if r["energy_cum"] else "0",
                 "Steps": len(r["temps"]),
             }
+        summary["Savings"] = {
+            "Avg Temp (°C)": "",
+            "Max Temp (°C)": "",
+            "Avg Cooling": "",
+            "Total Reward": "",
+            "Total Violations": "",
+            "Total Energy": f"{energy_saved_pct:.2f}% saved",
+            "Steps": "",
+        }
         st.markdown("### Summary")
-        st.dataframe(pd.DataFrame(summary).T, use_container_width=True)
+        st.dataframe(pd.DataFrame(summary).T)
 
 
 # ===================================================================
@@ -530,13 +749,15 @@ def page_training_performance():
         fig.add_trace(go.Scatter(x=ep_df["episode"], y=ep_df["reward_ma"], mode="lines",
                                  name=f"MA-{window}", line=dict(width=2)))
         fig.update_layout(title="Reward Trend", height=350)
-        st.plotly_chart(fig, use_container_width=True, key="tp_reward")
+        st.plotly_chart(fig, key="tp_reward", width="stretch")
+        st.caption("Raw rewards with moving average overlay — shows learning convergence over episodes.")
 
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=ep_df["episode"], y=ep_df["episode_length"], mode="lines+markers",
                                  name="Length", marker=dict(size=3)))
         fig.update_layout(title="Episode Length", height=300)
-        st.plotly_chart(fig, use_container_width=True, key="tp_length")
+        st.plotly_chart(fig, key="tp_length", width="stretch")
+        st.caption("Number of steps per episode — longer episodes indicate the agent avoids early termination.")
 
     with col2:
         fig = go.Figure()
@@ -546,17 +767,19 @@ def page_training_performance():
                                  name=f"MA-{window}", line=dict(width=2)))
         fig.add_hline(y=80, line_dash="dash", line_color="red")
         fig.update_layout(title="Temperature Trend", height=350)
-        st.plotly_chart(fig, use_container_width=True, key="tp_temp")
+        st.plotly_chart(fig, key="tp_temp", width="stretch")
+        st.caption("Temperature trend with moving average. Red dashed line = 80 °C safety threshold.")
 
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=ep_df["episode"], y=ep_df["viol_ma"], mode="lines",
                                  name=f"MA-{window}", line=dict(width=2, color="red")))
         fig.update_layout(title="Violations Trend", height=300)
-        st.plotly_chart(fig, use_container_width=True, key="tp_viol")
+        st.plotly_chart(fig, key="tp_viol", width="stretch")
+        st.caption("Moving average of safety violations — should approach zero as the agent learns safety constraints.")
 
     # Data table
     with st.expander("Raw Episode Data"):
-        st.dataframe(ep_df, use_container_width=True)
+        st.dataframe(ep_df)
 
 
 # ===================================================================
@@ -565,28 +788,53 @@ def page_training_performance():
 
 def display_real_system_monitor():
     st.subheader("🖥️ Real System Monitoring")
+
+    try:
+        import psutil  # noqa: F401 — verify availability
+    except ImportError:
+        st.error("psutil is not installed. Install it with `pip install psutil`.")
+        return
+
     if "monitor" not in st.session_state:
         st.session_state.monitor = LaptopSensorMonitor()
     monitor = st.session_state.monitor
 
-    with st.expander("Sensor Availability", expanded=True):
+    # --- System Info ---
+    with st.expander("System Info & Sensor Availability", expanded=True):
+        info = monitor.system_info
+        i1, i2, i3, i4 = st.columns(4)
+        i1.metric("Platform", info.get("platform", "N/A"))
+        i2.metric("CPU Cores", f"{info.get('cpu_count_physical', '?')} / {info.get('cpu_count_logical', '?')}")
+        i3.metric("Total RAM", f"{info.get('memory_total_gb', 0):.1f} GB")
+        i4.metric("Processor", info.get("processor", "N/A")[:30])
         st.text(monitor.get_sensor_availability_report())
 
     st.subheader("Live Sensor Readings")
     if st.button("Start Monitoring", key="rsm_start"):
-        placeholder = st.empty()
+        sensor_ph = st.empty()
+        chart_ph = st.empty()
         for i in range(60):
-            readings = monitor.read_sensors()
-            with placeholder.container():
+            try:
+                readings = monitor.read_sensors()
+            except Exception:
+                readings = {
+                    "cpu_usage_percent": 0.0,
+                    "cpu_temp_celsius": None,
+                    "cpu_freq_mhz": None,
+                    "memory_usage_percent": 0.0,
+                }
+            with sensor_ph.container():
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("CPU Usage", f"{readings['cpu_usage_percent']:.1f}%")
-                temp = readings["cpu_temp_celsius"]
+                temp = readings.get("cpu_temp_celsius")
                 c2.metric("CPU Temp", f"{temp:.1f} °C" if temp else "N/A")
-                freq = readings["cpu_freq_mhz"]
+                freq = readings.get("cpu_freq_mhz")
                 c3.metric("CPU Freq", f"{freq:.0f} MHz" if freq else "N/A")
                 c4.metric("Memory", f"{readings['memory_usage_percent']:.1f}%")
+            with chart_ph.container():
                 if len(monitor.cpu_usage_history) > 1:
-                    st.line_chart(pd.DataFrame({"CPU Usage": list(monitor.cpu_usage_history)}), key=f"rsm_cpu_{i}")
+                    st.line_chart(pd.DataFrame({"CPU Usage": list(monitor.cpu_usage_history)}))
+                    st.caption("Real-time CPU usage from the host machine running this dashboard.")
             time.sleep(1)
 
 

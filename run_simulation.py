@@ -146,7 +146,7 @@ def run_single_simulation(
             
             # Set cooling directly
             env.cooling_levels = np.clip(proposed_cooling, 0.0, 1.0)
-            action = 1  # Dummy action
+            action = 1  # PID maintain action
         
         # Step environment
         state, reward, terminated, truncated, info = env.step(action)
@@ -197,6 +197,9 @@ def run_single_simulation(
     print(f"\nHotspot Metrics:")
     print(f"  Max Hotspots: {metrics['hotspots']['max_hotspots']}")
     print(f"  Hotspot Ratio: {metrics['hotspots']['hotspot_ratio']*100:.1f}%")
+
+    # Store cooling history in metrics for energy comparison
+    metrics['_cooling_history'] = cooling_history
     
     # Visualize if requested
     if visualize:
@@ -370,6 +373,26 @@ def main():
         )
         print("\nComparison complete!")
         print(f"Results saved to: {results['experiment_dir']}")
+
+        # Also compute energy saved %
+        print("\nRunning RL vs PID energy comparison...")
+        rl_metrics = run_single_simulation(
+            controller_type='rl', config=config,
+            checkpoint_path=args.checkpoint, num_steps=args.steps,
+            workload_pattern=args.workload, scenario=scenario, visualize=False)
+        pid_metrics = run_single_simulation(
+            controller_type='pid', config=config,
+            num_steps=args.steps, workload_pattern=args.workload,
+            scenario=scenario, visualize=False)
+
+        energy_result = CoolingMetrics.compute_energy_saved(
+            rl_metrics['_cooling_history'], pid_metrics['_cooling_history'])
+        print(f"\n{'='*70}")
+        print("ENERGY SAVINGS SUMMARY")
+        print(f"{'='*70}")
+        print(f"  RL Cooling Energy:       {energy_result['rl_energy']:.2f} units")
+        print(f"  PID Cooling Energy:      {energy_result['baseline_energy']:.2f} units")
+        print(f"  Energy Saved:            {energy_result['energy_saved_percent']:.2f}%")
     else:
         # Run single simulation
         run_single_simulation(

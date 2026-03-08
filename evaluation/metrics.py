@@ -248,6 +248,55 @@ class CoolingMetrics:
         }
     
     @staticmethod
+    def compute_energy_saved(
+        rl_cooling_history: List[np.ndarray],
+        baseline_cooling_history: List[np.ndarray],
+    ) -> Dict[str, float]:
+        """
+        Compute energy saved by RL controller compared to a baseline.
+
+        Uses average energy per timestep (not totals) so that runs of
+        different lengths are comparable.  Both histories are trimmed
+        to the shorter length so the comparison spans the same number
+        of steps.
+
+        Formula:
+            EnergySaved% = ((PID_avg - RL_avg) / PID_avg) * 100
+
+        Returns:
+            Dictionary with rl_avg_energy, baseline_avg_energy, steps,
+            and energy_saved_percent (clamped to [-100, +100]).
+        """
+        # Equalise step counts
+        n = min(len(rl_cooling_history), len(baseline_cooling_history))
+        if n == 0:
+            return {
+                "rl_avg_energy": 0.0,
+                "baseline_avg_energy": 0.0,
+                "steps": 0,
+                "energy_saved_percent": 0.0,
+            }
+
+        rl_total = float(sum(np.mean(c) for c in rl_cooling_history[:n]))
+        bl_total = float(sum(np.mean(c) for c in baseline_cooling_history[:n]))
+
+        rl_avg = rl_total / n
+        bl_avg = bl_total / n
+
+        if bl_avg > 0:
+            saved_pct = ((bl_avg - rl_avg) / bl_avg) * 100
+            saved_pct = max(min(saved_pct, 100.0), -100.0)
+        else:
+            saved_pct = 0.0
+
+        return {
+            "rl_avg_energy": round(rl_avg, 6),
+            "baseline_avg_energy": round(bl_avg, 6),
+            "steps": n,
+            "energy_saved_percent": round(saved_pct, 4),
+        }
+
+    @staticmethod
     def compute_comprehensive_metrics(
         temperature_history: List[np.ndarray],
         cooling_history: List[np.ndarray],

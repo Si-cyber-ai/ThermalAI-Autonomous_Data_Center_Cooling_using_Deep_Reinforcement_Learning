@@ -51,10 +51,10 @@ class TrainingLogger:
 
     # ------------------------------------------------------------------
     def _init_csv(self, path: str, fields: List[str]):
-        if not os.path.exists(path):
-            with open(path, "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=fields)
-                writer.writeheader()
+        """Create (or overwrite) the CSV with a fresh header."""
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
 
     # ------------------------------------------------------------------
     def log_step(

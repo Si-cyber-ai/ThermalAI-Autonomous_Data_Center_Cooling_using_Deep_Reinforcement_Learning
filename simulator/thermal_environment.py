@@ -186,10 +186,51 @@ class DataCenterThermalEnv(gym.Env):
         )
         self.cooling_levels = self.prev_cooling_levels + cooling_delta
         
-        # Cooling floor safety: if avg temp > 70°C, enforce minimum cooling of 0.2
+        # Cooling floor safety: enforce minimum cooling above threshold
         avg_temp = np.mean(self.temperatures) if self.temperatures is not None else 0
-        if avg_temp > 70.0:
-            self.cooling_levels = np.maximum(self.cooling_levels, 0.2)
+        if avg_temp > 65.0:
+            floor = np.clip(0.20 + 0.06 * (avg_temp - 65.0), 0.20, 0.40)
+            self.cooling_levels = np.maximum(self.cooling_levels, floor)
+        
+        # --- Proactive cooling: boost cooling on rising temperature gradient ---
+        if len(self.temperature_history) >= 1:
+            prev_temps = self.temperature_history[-1]
+            temp_gradient = self.temperatures - prev_temps
+            rising_fast = temp_gradient > 2.0
+            if np.any(rising_fast):
+                self.cooling_levels[rising_fast] = np.maximum(
+                    self.cooling_levels[rising_fast],
+                    np.clip(0.3 + 0.1 * temp_gradient[rising_fast], 0.3, 0.8)
+                )
+        
+        # --- Per-rack escalation control ---
+        if self.temperatures is not None:
+            # 65-70°C: moderate cooling (strengthened)
+            mod_mask = (self.temperatures > 65.0) & (self.temperatures <= 70.0)
+            if np.any(mod_mask):
+                excess = (self.temperatures[mod_mask] - 65.0) / 5.0
+                self.cooling_levels[mod_mask] = np.maximum(
+                    self.cooling_levels[mod_mask],
+                    np.clip(0.35 + 0.15 * excess, 0.35, 0.50)
+                )
+            # 70-75°C: high cooling (strengthened)
+            high_mask = (self.temperatures > 70.0) & (self.temperatures <= 75.0)
+            if np.any(high_mask):
+                excess = (self.temperatures[high_mask] - 70.0) / 5.0
+                self.cooling_levels[high_mask] = np.maximum(
+                    self.cooling_levels[high_mask],
+                    np.clip(0.50 + 0.15 * excess, 0.50, 0.65)
+                )
+            # >75°C: strong cooling (hotspot targeting)
+            hot_mask = self.temperatures > 75.0
+            if np.any(hot_mask):
+                self.cooling_levels[hot_mask] = np.maximum(
+                    self.cooling_levels[hot_mask], 0.6
+                )
+            # >80°C: emergency cooling
+            emerg_mask = self.temperatures > 80.0
+            if np.any(emerg_mask):
+                self.cooling_levels[emerg_mask] = 1.0
         
         self.prev_cooling_levels = self.cooling_levels.copy()
         
@@ -209,6 +250,28 @@ class DataCenterThermalEnv(gym.Env):
             self.ambient_temp,
             dt=1.0
         )
+        
+        # --- Post-update safety override: correct any remaining violations ---
+        old_cooling = self.cooling_levels.copy()
+        critical_mask = self.temperatures > self.critical_temp       # >85°C
+        violation_mask = self.temperatures > self.max_temp            # >80°C
+        warning_mask = self.temperatures > self.config['safety']['temperature_warning']  # >75°C
+        if np.any(critical_mask):
+            self.cooling_levels[critical_mask] = 1.0
+        if np.any(violation_mask):
+            self.cooling_levels[violation_mask] = np.maximum(
+                self.cooling_levels[violation_mask], 1.0
+            )
+        if np.any(warning_mask):
+            self.cooling_levels[warning_mask] = np.maximum(
+                self.cooling_levels[warning_mask], 0.6
+            )
+        # Apply incremental cooling correction to temperatures
+        additional_cooling = self.cooling_levels - old_cooling
+        if np.any(additional_cooling > 0):
+            beta = self.config['simulation']['beta']
+            self.temperatures -= additional_cooling * beta * 100.0
+        self.prev_cooling_levels = self.cooling_levels.copy()
         
         # Check for safety violations
         violations = np.sum(self.temperatures > self.max_temp)
@@ -271,47 +334,47 @@ class DataCenterThermalEnv(gym.Env):
     
     def _compute_reward(self, violations: int, critical_violations: int) -> float:
         """
-        Compute reward based on energy efficiency and safety.
-        
-        Reward = -energy_cost - 10 * temperature_excess - 50 * safety_violation - 0.5 * cooling_instability
-        
-        Where:
-            temperature_excess = max(0, temperature - safe_temperature)
-            safety_violation = 1 if any rack > max_temp else 0
-        
+        Compute reward based on energy efficiency, temperature control, and safety.
+
+        Components:
+            1. Base reward: penalises energy cost, temperature above 65 °C,
+               and safety violations (>80 °C).
+            2. Energy-saving bonus: rewards keeping avg cooling below 0.35.
+            3. Stability penalty: penalises rapid temperature changes.
+
         Args:
             violations: Number of temperature violations
             critical_violations: Number of critical violations
-            
+
         Returns:
             Reward value
         """
-        # Energy consumption cost (proportional to cooling effort)
-        energy_cost = np.mean(self.cooling_levels)
-        
-        # Temperature excess penalty: per-rack overshoot beyond safe threshold
-        safe_temp = self.config['safety']['max_temperature']
-        temperature_excess = np.sum(np.maximum(0.0, self.temperatures - safe_temp))
-        
-        # Safety violation: binary per-rack violation count
-        safety_violation = violations + critical_violations * 5
-        
-        # Cooling instability: penalize rapid cooling changes
-        if len(self.cooling_history) > 1:
-            cooling_instability = np.mean(np.abs(
-                self.cooling_history[-1] - self.cooling_history[-2]
-            ))
-        else:
-            cooling_instability = 0.0
-        
-        # Total reward
+        # Energy consumption cost
+        energy_cost = float(np.mean(self.cooling_levels))
+
+        # Average rack temperature
+        avg_temperature = float(np.mean(self.temperatures))
+
+        # Violations: racks above 80 °C
+        violation_count = int(np.sum(self.temperatures > 80.0))
+
+        # --- Base reward (S2) ---
         reward = (
-            - energy_cost
-            - 10.0 * temperature_excess
-            - 50.0 * safety_violation
-            - 0.5 * cooling_instability
+            -0.6 * energy_cost
+            - 15.0 * max(0.0, avg_temperature - 65.0)
+            - 200.0 * violation_count
         )
-        
+
+        # --- Energy-saving bonus (S3) ---
+        energy_bonus = max(0.0, 0.35 - energy_cost) * 10.0
+        reward += energy_bonus
+
+        # --- Temperature stability penalty (S4) ---
+        if len(self.temperature_history) >= 1:
+            prev_avg = float(np.mean(self.temperature_history[-1]))
+            stability_penalty = abs(avg_temperature - prev_avg) * 2.0
+            reward -= stability_penalty
+
         return reward
     
     def _get_observation(self) -> np.ndarray:

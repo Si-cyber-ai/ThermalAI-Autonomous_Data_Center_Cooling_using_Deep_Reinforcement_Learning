@@ -130,7 +130,7 @@ class ExperimentRunner:
                 env.prev_cooling_levels = proposed_cooling.copy()
                 
                 # Still need to step environment
-                action = 1  # Dummy action
+                action = 1  # PID maintain action
             else:
                 raise ValueError(f"Unknown controller type: {controller_type}")
             
