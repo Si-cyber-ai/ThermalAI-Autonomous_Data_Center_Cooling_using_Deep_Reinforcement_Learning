@@ -238,9 +238,8 @@ class DataCenterThermalEnv(gym.Env):
         if self.workload_generator is not None:
             self.cpu_workload = self.workload_generator.generate(self.current_step)
         else:
-            # Random walk workload
-            workload_change = np.random.uniform(-0.05, 0.05, size=(self.rows, self.cols))
-            self.cpu_workload = np.clip(self.cpu_workload + workload_change, 0.0, 1.0)
+            # Random walk workload bounded to realistic server utilization
+            self.cpu_workload = np.random.uniform(0.4, 0.9, size=(self.rows, self.cols))
         
         # Update temperatures using heat transfer model
         self.temperatures = self.heat_model.update_temperatures(
@@ -250,6 +249,9 @@ class DataCenterThermalEnv(gym.Env):
             self.ambient_temp,
             dt=1.0
         )
+
+        # Clamp temperatures to realistic bounds [20, 85]
+        self.temperatures = np.clip(self.temperatures, 20.0, 85.0)
         
         # --- Post-update safety override: correct any remaining violations ---
         old_cooling = self.cooling_levels.copy()
@@ -334,13 +336,12 @@ class DataCenterThermalEnv(gym.Env):
     
     def _compute_reward(self, violations: int, critical_violations: int) -> float:
         """
-        Compute reward based on energy efficiency, temperature control, and safety.
+        Compute reward balancing temperature control and energy efficiency.
 
-        Components:
-            1. Base reward: penalises energy cost, temperature above 65 °C,
-               and safety violations (>80 °C).
-            2. Energy-saving bonus: rewards keeping avg cooling below 0.35.
-            3. Stability penalty: penalises rapid temperature changes.
+        Formula:
+            reward = -|temp - target| - 0.5 * cooling_energy
+            if temp > 80: reward -= 100
+            if temp < 22: reward -= 5
 
         Args:
             violations: Number of temperature violations
@@ -349,31 +350,17 @@ class DataCenterThermalEnv(gym.Env):
         Returns:
             Reward value
         """
-        # Energy consumption cost
-        energy_cost = float(np.mean(self.cooling_levels))
-
-        # Average rack temperature
+        target_temp = 65.0
         avg_temperature = float(np.mean(self.temperatures))
+        cooling_energy = float(np.mean(self.cooling_levels))
 
-        # Violations: racks above 80 °C
-        violation_count = int(np.sum(self.temperatures > 80.0))
+        reward = -abs(avg_temperature - target_temp) - 0.5 * cooling_energy
 
-        # --- Base reward (S2) ---
-        reward = (
-            -0.6 * energy_cost
-            - 15.0 * max(0.0, avg_temperature - 65.0)
-            - 200.0 * violation_count
-        )
+        if avg_temperature > 80:
+            reward -= 100
 
-        # --- Energy-saving bonus (S3) ---
-        energy_bonus = max(0.0, 0.35 - energy_cost) * 10.0
-        reward += energy_bonus
-
-        # --- Temperature stability penalty (S4) ---
-        if len(self.temperature_history) >= 1:
-            prev_avg = float(np.mean(self.temperature_history[-1]))
-            stability_penalty = abs(avg_temperature - prev_avg) * 2.0
-            reward -= stability_penalty
+        if avg_temperature < 22:
+            reward -= 5
 
         return reward
     

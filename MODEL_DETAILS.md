@@ -66,22 +66,23 @@
 ## Reward Function
 
 ```
-reward = (
-    −0.6 × energy_cost
-    − 15 × max(0, avg_temperature − 65)
-    − 200 × violations
-    + max(0, 0.35 − energy_cost) × 10    # energy-saving bonus
-    − |current_temp − previous_temp| × 2  # stability penalty
-)
+target_temp = 65
+
+reward = -abs(temp - target_temp) - 0.5 * cooling_energy
+
+if temp > 80:
+    reward -= 100
+
+if temp < 22:
+    reward -= 5
 ```
 
 | Term | Purpose |
 |------|---------|
-| Energy cost (−0.6) | Penalises excessive cooling to reduce energy waste |
-| Temperature excess (−15) | Strong penalty when avg temperature exceeds 65 °C |
-| Violations (−200) | Severe penalty for racks above 80 °C |
-| Energy bonus (+10) | Rewards keeping avg cooling below 0.35 |
-| Stability penalty (−2) | Discourages rapid temperature swings |
+| Temperature deviation (−\|temp − 65\|) | Penalises distance from optimal 65 °C |
+| Cooling energy (−0.5) | Penalises excessive cooling to save energy |
+| Overheat penalty (−100) | Severe penalty when temperatures exceed 80 °C |
+| Overcool penalty (−5) | Mild penalty for unrealistically low temperatures |
 
 ---
 
