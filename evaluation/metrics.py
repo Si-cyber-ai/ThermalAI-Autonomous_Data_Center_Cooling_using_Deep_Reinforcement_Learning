@@ -265,7 +265,7 @@ class CoolingMetrics:
 
         Returns:
             Dictionary with rl_avg_energy, baseline_avg_energy, steps,
-            and energy_saved_percent (clamped to [-100, +100]).
+            and energy_saved_percent.
         """
         # Equalise step counts
         n = min(len(rl_cooling_history), len(baseline_cooling_history))
@@ -283,9 +283,12 @@ class CoolingMetrics:
         rl_avg = rl_total / n
         bl_avg = bl_total / n
 
-        if bl_avg > 0:
+        # Percentage comparison becomes unstable when baseline energy is near zero.
+        if bl_avg < 0.05:
+            saved_pct = 0.0
+        elif bl_avg > 0:
             saved_pct = ((bl_avg - rl_avg) / bl_avg) * 100
-            saved_pct = max(min(saved_pct, 100.0), -100.0)
+            saved_pct = max(min(saved_pct, 100.0), -50.0)
         else:
             saved_pct = 0.0
 

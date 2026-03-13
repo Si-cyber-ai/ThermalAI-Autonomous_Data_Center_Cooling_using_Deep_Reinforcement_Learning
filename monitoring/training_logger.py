@@ -51,10 +51,15 @@ class TrainingLogger:
 
     # ------------------------------------------------------------------
     def _init_csv(self, path: str, fields: List[str]):
-        """Create (or overwrite) the CSV with a fresh header."""
-        with open(path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fields)
-            writer.writeheader()
+        """Create the CSV with a fresh header only if the file is new or empty.
+
+        When resuming from a checkpoint the file already contains data, so
+        we leave it intact and subsequent log_step / end_episode calls append.
+        """
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            with open(path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fields)
+                writer.writeheader()
 
     # ------------------------------------------------------------------
     def log_step(

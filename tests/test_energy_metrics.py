@@ -44,10 +44,22 @@ def _run_controller(config, *, use_rl: bool, num_steps: int = 300):
     )
     env = DataCenterThermalEnv(config_path=cfg_path, workload_generator=workload_gen)
 
-    pid = PIDController(
+    pid_controller = PIDController(
         kp=config["pid"]["kp"], ki=config["pid"]["ki"],
         kd=config["pid"]["kd"], setpoint=config["pid"]["setpoint"],
     )
+    rl_agent = DQNAgent(
+        state_dim=env.observation_space.shape[0],
+        action_dim=env.action_space.n,
+        hidden_dim=config["rl"]["hidden_dim"],
+    )
+    ckpt_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "checkpoints",
+        "dqn_final.pth",
+    )
+    if os.path.exists(ckpt_path):
+        rl_agent.load_checkpoint(ckpt_path)
     agent = CoolingAgent()
 
     state, _ = env.reset()
@@ -56,16 +68,12 @@ def _run_controller(config, *, use_rl: bool, num_steps: int = 300):
 
     for step in range(num_steps):
         if use_rl:
-            # RL mode: use CoolingAgent supervisor (falls back to PID under
-            # moderate risk since RL checkpoint may not exist)
-            grids = env.get_state_grid()
-            proposed = pid.compute(grids["temperatures"])
-            env.cooling_levels = np.clip(proposed, 0.0, 1.0)
-            state, _, terminated, _, _ = env.step(1)
+            action = rl_agent.select_action(state, training=False)
+            state, _, terminated, _, _ = env.step(action)
         else:
             grids = env.get_state_grid()
-            proposed = pid.compute(grids["temperatures"])
-            env.cooling_levels = np.clip(proposed, 0.0, 1.0)
+            pid_cooling = pid_controller.compute(grids["temperatures"])
+            env.cooling_levels = np.clip(pid_cooling, 0.0, 1.0)
             state, _, terminated, _, _ = env.step(1)
 
         agent.post_step_safety(env)

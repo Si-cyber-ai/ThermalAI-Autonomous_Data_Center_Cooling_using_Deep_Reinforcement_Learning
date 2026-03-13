@@ -37,7 +37,7 @@ rl:
   batch_size: 64
   memory_size: 100000
   target_update_freq: 10
-  training_episodes: 1000
+  training_episodes: 800
   entropy_weight: 0.01  # Action entropy encouragement
   
 # PID Controller
@@ -78,5 +78,5 @@ visualization:
 # Model Checkpoints
 checkpoints:
   save_dir: "checkpoints"
-  save_frequency: 50  # Save every N episodes
+  save_frequency: 100  # Save every N episodes
   keep_last: 5  # Keep last N checkpoints

@@ -46,6 +46,10 @@ class TrainingPipeline:
         self.log_dir = log_dir
         os.makedirs(checkpoint_dir, exist_ok=True)
         os.makedirs(log_dir, exist_ok=True)
+        # plots/ directory for individual per-metric training graphs
+        self.plots_dir = self.config.get("visualization", {}).get("plot_dir", "plots")
+        os.makedirs(self.plots_dir, exist_ok=True)
+        self.enable_training_plots = bool(self.config.get("visualization", {}).get("save_plots", True))
         
         # Initialize workload generator
         grid_size = tuple(self.config['simulation']['grid_size'])
@@ -139,7 +143,8 @@ class TrainingPipeline:
                     f"dqn_episode_{episode+1}.pth"
                 )
                 self.agent.save_checkpoint(checkpoint_path)
-                self._save_training_plots(episode + 1)
+                if self.enable_training_plots:
+                    self._save_training_plots(episode + 1)
             
             # Log progress
             if (episode + 1) % 10 == 0:
@@ -148,7 +153,8 @@ class TrainingPipeline:
         # Final checkpoint
         final_checkpoint = os.path.join(self.checkpoint_dir, "dqn_final.pth")
         self.agent.save_checkpoint(final_checkpoint)
-        self._save_training_plots(num_episodes)
+        if self.enable_training_plots:
+            self._save_training_plots(num_episodes)
         
         print("\nTraining completed!")
         

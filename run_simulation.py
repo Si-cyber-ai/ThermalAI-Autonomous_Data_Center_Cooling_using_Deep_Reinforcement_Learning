@@ -97,7 +97,10 @@ def run_single_simulation(
     else:
         raise ValueError(f"Unknown controller type: {controller_type}")
     
-    # Apply scenario if specified
+    # Reset environment
+    state, _ = env.reset()
+
+    # Apply scenario after reset so workload injection is not overwritten.
     if scenario:
         print(f"Applying scenario: {scenario}")
         if scenario == "hotspot":
@@ -106,9 +109,6 @@ def run_single_simulation(
             env.cpu_workload = WorkloadScenario.create_edge_heavy_scenario(grid_size)
         elif scenario == "gradient":
             env.cpu_workload = WorkloadScenario.create_gradient_scenario(grid_size)
-    
-    # Reset environment
-    state, _ = env.reset()
     
     # History tracking
     temperature_history = []
@@ -390,8 +390,8 @@ def main():
         print(f"\n{'='*70}")
         print("ENERGY SAVINGS SUMMARY")
         print(f"{'='*70}")
-        print(f"  RL Cooling Energy:       {energy_result['rl_energy']:.2f} units")
-        print(f"  PID Cooling Energy:      {energy_result['baseline_energy']:.2f} units")
+        print(f"  RL Cooling Energy:       {energy_result['rl_avg_energy']:.2f} units")
+        print(f"  PID Cooling Energy:      {energy_result['baseline_avg_energy']:.2f} units")
         print(f"  Energy Saved:            {energy_result['energy_saved_percent']:.2f}%")
     else:
         # Run single simulation
